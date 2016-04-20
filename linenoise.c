@@ -3,7 +3,8 @@
  *
  * You can find the latest source code at:
  *
- *   http://github.com/msteveb/linenoise
+ * http://github.com/hp-peti/linenoise
+ *   (forked from http://github.com/msteveb/linenoise)
  *   (forked from http://github.com/antirez/linenoise)
  *
  * Does a number of crazy assumptions that happen to be true in 99.9999% of
@@ -14,6 +15,7 @@
  * Copyright (c) 2010, Salvatore Sanfilippo <antirez at gmail dot com>
  * Copyright (c) 2010, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * Copyright (c) 2011, Steve Bennett <steveb at workware dot net dot au>
+ * Copyright (c) 2016, Peter Hanos-Puskai <hp dot peti at gmail dot com>
  *
  * All rights reserved.
  *
@@ -48,6 +50,7 @@
  *
  * Bloat:
  * - Completion?
+ * - Color printing?
  *
  * Unix/termios
  * ------------
@@ -100,6 +103,9 @@
  * If __MINGW32__ is defined, the win32 console API is used.
  * This could probably be made to work for the msvc compiler too.
  * This support based in part on work by Jon Griffiths.
+
+ * Added thread-synchronised coloured output support
+ * Works with MSVC 2008, 2012
  */
 
 #ifdef _WIN32 /* Windows platform, either MinGW or Visual Studio (MSVC) */
@@ -118,6 +124,8 @@
 #include <sys/ioctl.h>
 #include <sys/poll.h>
 #define USE_TERMIOS
+#define USE_PTHREADS
+#define USE_OWN_STRDUP
 #define HAVE_UNISTD_H
 #endif
 
@@ -134,6 +142,19 @@
 
 #include "linenoise.h"
 #include "utf8.h"
+
+#ifdef USE_PTHREADS
+#include <pthread.h>
+#endif
+
+#include <assert.h>
+
+#ifdef USE_OWN_STRDUP
+// multi-threaded strdup is broken in eglibc-2.19 x64
+#undef strdup
+#define strdup _strdup
+static char *_strdup(const char * str);
+#endif
 
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE 4096
@@ -167,6 +188,7 @@ struct current {
     int chars;  /* Number of chars in 'buf' (utf-8 chars) */
     int pos;    /* Cursor position, measured in chars */
     int cols;   /* Size of the window, in chars */
+    int rows;   /* Screen rows */
     const char *prompt;
     char *capture; /* Allocated capture buffer, or NULL for none. Always null terminated */
 #if defined(USE_TERMIOS)
@@ -174,16 +196,33 @@ struct current {
 #elif defined(USE_WINCONSOLE)
     HANDLE outh; /* Console output handle */
     HANDLE inh; /* Console input handle */
-    int rows;   /* Screen rows */
     int x;      /* Current column during output */
     int y;      /* Current row */
 #endif
 };
 
+static struct linenoiseTextAttr *promptAttr = 0;
+
+#ifndef _WIN32
+static int interrupt_pipe[2] = { -1, -1 };
+#else
+static HANDLE interruptEvent = 0;
+#endif
+
+static void lineEditModeCritical_Enter();
+static void lineEditModeCritical_Leave();
+static void historyCritical_Enter();
+static void historyCritical_Leave();
+
+static void updateLineEditingMode(const char *prompt, struct current *current);
+
 static int fd_read(struct current *current);
 static int getWindowSize(struct current *current);
 
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr);
+
 void linenoiseHistoryFree(void) {
+    historyCritical_Enter();
     if (history) {
         int j;
 
@@ -193,6 +232,7 @@ void linenoiseHistoryFree(void) {
         history = NULL;
         history_len = 0;
     }
+    historyCritical_Leave();
 }
 
 #if defined(USE_TERMIOS)
@@ -254,6 +294,9 @@ fatal:
     if (tcsetattr(current->fd,TCSADRAIN,&raw) < 0) {
         goto fatal;
     }
+
+    updateLineEditingMode(0, current);
+
     rawmode = 1;
     return 0;
 }
@@ -262,6 +305,7 @@ static void disableRawMode(struct current *current) {
     /* Don't even check the return value as it's too late. */
     if (rawmode && tcsetattr(current->fd,TCSADRAIN,&orig_termios) != -1)
         rawmode = 0;
+    updateLineEditingMode(0,0);
 }
 
 /* At exit we'll try to fix the terminal to the initial conditions. */
@@ -320,7 +364,10 @@ static void eraseEol(struct current *current)
 
 static void setCursorPos(struct current *current, int x)
 {
-    fd_printf(current->fd, "\r\x1b[%dC", x);
+    if (x > 0)
+        fd_printf(current->fd, "\r\x1b[%dC", x);
+    else
+        write(current->fd, "\r", 1);
 }
 
 /**
@@ -330,22 +377,38 @@ static void setCursorPos(struct current *current, int x)
  *
  * Returns -1 if no char is received within the time or an error occurs.
  */
+
 static int fd_read_char(int fd, int timeout)
 {
-    struct pollfd p;
+    struct pollfd p[2];
     unsigned char c;
 
-    p.fd = fd;
-    p.events = POLLIN;
+    p[0].fd = fd;
+    p[0].events = POLLIN;
+    p[1].fd = interrupt_pipe[0];
+    p[1].events = POLLIN;
 
-    if (poll(&p, 1, timeout) == 0) {
+    if (poll(&p, 2, timeout) == 0) {
         /* timeout */
         return -1;
     }
+    if (p[1].revents & POLLIN)
+    {
+        char tmp;
+        read(p[1].fd, &tmp, 1);
+        return -1;
+    }
+
     if (read(fd, &c, 1) != 1) {
         return -1;
     }
     return c;
+}
+
+static void ensure_interrupt_pipe()
+{
+    if (interrupt_pipe[1] == -1)
+        pipe(interrupt_pipe);
 }
 
 /**
@@ -355,30 +418,40 @@ static int fd_read_char(int fd, int timeout)
 static int fd_read(struct current *current)
 {
 #ifdef USE_UTF8
-    char buf[4];
+    unsigned char buf[4];
     int n;
     int i;
+#endif
     int c;
+    ensure_interrupt_pipe();
+    lineEditModeCritical_Leave();
+    c = fd_read_char(current->fd, -1);
+    lineEditModeCritical_Enter();
 
-    if (read(current->fd, &buf[0], 1) != 1) {
-        return -1;
+#ifdef USE_UTF8
+    if (c < 0 || c > 0xFF) {
+
+        return c;
     }
+    buf[0] = c;
     n = utf8_charlen(buf[0]);
     if (n < 1 || n > 3) {
         return -1;
     }
     for (i = 1; i < n; i++) {
-        if (read(current->fd, &buf[i], 1) != 1) {
+        lineEditModeCritical_Leave();
+        c = fd_read_char(current->fd, -1);
+        lineEditModeCritical_Enter();
+        if (c < 0 || c > 0xFF) {
             return -1;
         }
+        buf[i] = c;
     }
     buf[n] = 0;
     /* decode and return the character */
     utf8_tounicode(buf, &c);
-    return c;
-#else
-    return fd_read_char(current->fd, -1);
 #endif
+    return c;
 }
 
 static int countColorControlChars(const char* prompt)
@@ -437,7 +510,7 @@ static int countColorControlChars(const char* prompt)
  * Stores the current cursor column in '*cols'.
  * Returns 1 if OK, or 0 if failed to determine cursor pos.
  */
-static int queryCursor(int fd, int* cols)
+static int queryCursor(int fd, int* cols, int *rows)
 {
     /* control sequence - report cursor location */
     fd_printf(fd, "\x1b[6n");
@@ -450,7 +523,9 @@ static int queryCursor(int fd, int* cols)
         while (1) {
             int ch = fd_read_char(fd, 100);
             if (ch == ';') {
-                /* Ignore rows */
+                /* Got rows */
+                if (rows)
+                    *rows = n;
                 n = 0;
             }
             else if (ch == 'R') {
@@ -482,6 +557,7 @@ static int getWindowSize(struct current *current)
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col != 0) {
         current->cols = ws.ws_col;
+        current->rows = ws.ws_row;
         return 0;
     }
 
@@ -504,9 +580,10 @@ static int getWindowSize(struct current *current)
         int here;
 
         current->cols = 80;
+        current->rows = 0;
 
         /* (a) */
-        if (queryCursor (current->fd, &here)) {
+        if (queryCursor (current->fd, &here, 0)) {
             /* (b) */
             fd_printf(current->fd, "\x1b[999C");
 
@@ -514,7 +591,7 @@ static int getWindowSize(struct current *current)
              * For paranoia we still check and have a fallback action
              * for (d) in case of failure..
              */
-            if (!queryCursor (current->fd, &current->cols)) {
+            if (!queryCursor (current->fd, &current->cols, 0)) {
                 /* (d') Unable to get accurate position data, reset
                  * the cursor to the far left. While this may not
                  * restore the exact original position it should not
@@ -617,14 +694,16 @@ static int enableRawMode(struct current *current) {
         return -1;
     }
     if (GetConsoleMode(current->inh, &orig_consolemode)) {
-        SetConsoleMode(current->inh, ENABLE_PROCESSED_INPUT);
+        SetConsoleMode(current->inh, 0 /*  ENABLE_PROCESSED_INPUT */);
     }
+    updateLineEditingMode(0, current);
     return 0;
 }
 
 static void disableRawMode(struct current *current)
 {
     SetConsoleMode(current->inh, orig_consolemode);
+    updateLineEditingMode(0, 0);
 }
 
 static void clearScreen(struct current *current)
@@ -642,11 +721,8 @@ static void clearScreen(struct current *current)
 
 static void cursorToLeft(struct current *current)
 {
-    COORD pos;
+    COORD pos = { 0, (SHORT)current->y };
     DWORD n;
-
-    pos.X = 0;
-    pos.Y = (SHORT)current->y;
 
     FillConsoleOutputAttribute(current->outh,
         FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_GREEN, current->cols, pos, &n);
@@ -655,24 +731,19 @@ static void cursorToLeft(struct current *current)
 
 static int outputChars(struct current *current, const char *buf, int len)
 {
-    COORD pos;
+    COORD pos = { (SHORT)current->x, (SHORT)current->y };
     DWORD n;
 
-    pos.X = (SHORT)current->x;
-    pos.Y = (SHORT)current->y;
-
-    WriteConsoleOutputCharacter(current->outh, buf, len, pos, &n);
+    SetConsoleCursorPosition(current->outh, pos);
+    WriteConsoleA(current->outh, buf, len, &n, 0);
     current->x += len;
     return 0;
 }
 
 static void outputControlChar(struct current *current, char ch)
 {
-    COORD pos;
+    COORD pos = { (SHORT)current->x, (SHORT)current->y };
     DWORD n;
-
-    pos.X = (SHORT) current->x;
-    pos.Y = (SHORT) current->y;
 
     FillConsoleOutputAttribute(current->outh, BACKGROUND_INTENSITY, 2, pos, &n);
     outputChars(current, "^", 1);
@@ -681,67 +752,87 @@ static void outputControlChar(struct current *current, char ch)
 
 static void eraseEol(struct current *current)
 {
-    COORD pos;
+    COORD pos = { (SHORT)current->x, (SHORT)current->y };
     DWORD n;
-
-    pos.X = (SHORT) current->x;
-    pos.Y = (SHORT) current->y;
 
     FillConsoleOutputCharacter(current->outh, ' ', current->cols - current->x, pos, &n);
 }
 
 static void setCursorPos(struct current *current, int x)
 {
-    COORD pos;
-
-    pos.X = (SHORT)x;
-    pos.Y = (SHORT) current->y;
+    COORD pos = { (SHORT)x, (SHORT)current->y };
 
     SetConsoleCursorPosition(current->outh, pos);
     current->x = x;
 }
+
+static void ensureInterruptEvent()
+{
+    if (interruptEvent == 0)
+        interruptEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+}
+
 
 static int fd_read(struct current *current)
 {
     while (1) {
         INPUT_RECORD irec;
         DWORD n;
-        if (WaitForSingleObject(current->inh, INFINITE) != WAIT_OBJECT_0) {
+        HANDLE waitHandles[2];
+
+        ensureInterruptEvent();
+        waitHandles[0] = current->inh;
+        waitHandles[1] = interruptEvent;
+        lineEditModeCritical_Leave();
+        if (WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE) != WAIT_OBJECT_0) {
+            lineEditModeCritical_Enter();
             break;
         }
         if (!ReadConsoleInput (current->inh, &irec, 1, &n)) {
+            lineEditModeCritical_Enter();
             break;
         }
+        lineEditModeCritical_Enter();
         if (irec.EventType == KEY_EVENT && irec.Event.KeyEvent.bKeyDown) {
             KEY_EVENT_RECORD *k = &irec.Event.KeyEvent;
-            if (k->dwControlKeyState & ENHANCED_KEY) {
+            if ((k->dwControlKeyState & ( 
+                LEFT_ALT_PRESSED | LEFT_CTRL_PRESSED |
+                RIGHT_ALT_PRESSED | RIGHT_CTRL_PRESSED |
+                SHIFT_PRESSED
+            )) == 0) {
                 switch (k->wVirtualKeyCode) {
-                 case VK_LEFT:
+                case VK_LEFT:
                     return SPECIAL_LEFT;
-                 case VK_RIGHT:
+                case VK_RIGHT:
                     return SPECIAL_RIGHT;
-                 case VK_UP:
+                case VK_UP:
                     return SPECIAL_UP;
-                 case VK_DOWN:
+                case VK_DOWN:
                     return SPECIAL_DOWN;
-                 case VK_INSERT:
+                case VK_INSERT:
                     return SPECIAL_INSERT;
-                 case VK_DELETE:
+                case VK_DELETE:
                     return SPECIAL_DELETE;
-                 case VK_HOME:
+                case VK_HOME:
                     return SPECIAL_HOME;
-                 case VK_END:
+                case VK_END:
                     return SPECIAL_END;
-                 case VK_PRIOR:
+                case VK_PRIOR:
                     return SPECIAL_PAGE_UP;
-                 case VK_NEXT:
+                case VK_NEXT:
                     return SPECIAL_PAGE_DOWN;
+                /* apparently TightVNC has some issues sending these */
+                case VK_TAB:
+                case VK_BACK:
+                case VK_RETURN:
+                    return k->uChar.AsciiChar;
                 }
             }
-            /* Note that control characters are already translated in AsciiChar */
-            else if (k->wVirtualKeyCode == VK_CONTROL)
-	        continue;
-            else {
+            if (k->dwControlKeyState & ENHANCED_KEY) {
+                /* Note that control characters are already translated in AsciiChar */
+            } else if (k->wVirtualKeyCode == VK_CONTROL) {
+                continue;
+            } else {
 #ifdef USE_UTF8
                 return k->uChar.UnicodeChar;
 #else
@@ -768,7 +859,7 @@ static int getWindowSize(struct current *current)
         return -1;
     }
     current->cols = info.dwSize.X;
-    current->rows = info.dwSize.Y;
+    current->rows = (info.srWindow.Bottom - info.srWindow.Top) + 1;
     if (current->cols <= 0 || current->rows <= 0) {
         current->cols = 80;
         return -1;
@@ -777,6 +868,7 @@ static int getWindowSize(struct current *current)
     current->x = info.dwCursorPosition.X;
     return 0;
 }
+
 #endif
 
 static int utf8_getchars(char *buf, int c)
@@ -804,6 +896,93 @@ static int get_char(struct current *current, int pos)
     return -1;
 }
 
+
+struct line_editing_mode
+{
+    int rawmode;
+    struct current *current;
+    const char * prompt;
+#ifdef USE_TERMIOS
+    int out;
+    int err;
+#endif
+};
+
+static struct line_editing_mode line_editing_mode =
+{
+    0, 0
+};
+
+#if !defined USE_PTHREADS && defined(USE_WINCONSOLE)
+
+typedef struct {
+    volatile long init;
+    CRITICAL_SECTION realMutex;
+} pthread_mutex_t;
+
+#define PTHREAD_MUTEX_INITIALIZER {0}
+
+static void pthread_mutex_lock(pthread_mutex_t *mutex)
+{
+    switch (InterlockedCompareExchange(&mutex->init,
+        /*exhange: */ 1, /*comparand*/ 0
+        ) /* --> previous value */ )
+    {
+    case 0: // we need to initialise it
+        InitializeCriticalSection(&mutex->realMutex);
+        InterlockedIncrement(&mutex->init); // signal that we're done
+        break;
+    case 1: // someone is initialising it
+        while (InterlockedCompareExchange(&mutex->init, 2, 2) < 2)
+        {
+            Sleep(0);
+        }
+        break;
+    }
+    EnterCriticalSection(&mutex->realMutex);
+}
+
+static void pthread_mutex_unlock(pthread_mutex_t *mutex)
+{
+    LeaveCriticalSection(&mutex->realMutex);
+}
+
+#endif
+
+static pthread_mutex_t line_edit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int line_edit_mutex_taken = 0;
+static int history_mutex_taken = 0;
+
+static void lineEditModeCritical_Enter()
+{
+    pthread_mutex_lock(&line_edit_mutex);
+    assert(++line_edit_mutex_taken == 1);
+}
+static void lineEditModeCritical_Leave()
+{
+    assert(--line_edit_mutex_taken == 0);
+    pthread_mutex_unlock(&line_edit_mutex);
+}
+static void historyCritical_Enter()
+{
+    pthread_mutex_lock(&history_mutex);
+    assert(++history_mutex_taken == 1);
+}
+static void historyCritical_Leave()
+{
+    assert(--history_mutex_taken == 0);
+    pthread_mutex_unlock(&history_mutex);
+}
+
+
+static void updateLineEditingMode(const char* prompt, struct current* current)
+{
+    line_editing_mode.rawmode = (current != 0);
+    line_editing_mode.prompt = prompt;
+    line_editing_mode.current = current;
+}
+
 static void refreshLine(const char *prompt, struct current *current)
 {
     int plen;
@@ -816,6 +995,8 @@ static void refreshLine(const char *prompt, struct current *current)
     int b;
     int ch;
     int n;
+
+    updateLineEditingMode(prompt, current);
 
     /* Should intercept SIGWINCH. For now, just get the size every time */
     getWindowSize(current);
@@ -865,7 +1046,7 @@ static void refreshLine(const char *prompt, struct current *current)
 
     /* Cursor to left edge, then the prompt */
     cursorToLeft(current);
-    outputChars(current, prompt, plen);
+    outputCharsAttr(current, prompt, plen, promptAttr);
 
     /* Now the current buffer content */
 
@@ -904,12 +1085,37 @@ static void refreshLine(const char *prompt, struct current *current)
     setCursorPos(current, pos + pchars + backup);
 }
 
+static void set_current_space_tail(struct current *current, const char *str, char space, const char *tail)
+{
+    int len = strlen(str);
+    if (current->bufmax-1 < len) {
+        len = current->bufmax-1;
+    }
+    memcpy(current->buf, str, len);
+    current->buf[len] = 0;
+    current->pos = current->chars = utf8_strlen(current->buf, len);
+
+    if (tail) {
+        int tlen;
+        if (space && current->bufmax > len+1) {
+            current->buf[len++] = space;
+        }
+        tlen = strlen(tail);
+        if (current->bufmax-1 < len + tlen) {
+            tlen = current->bufmax-1 - (len + tlen);
+        }
+        memcpy(current->buf + len, tail, tlen);
+        len += tlen;
+        current->chars = utf8_strlen(current->buf, len);
+
+    }
+    current->len = len;
+    memset(current->buf + len, 0, current->bufmax - len);
+}
+
 static void set_current(struct current *current, const char *str)
 {
-    strncpy(current->buf, str, current->bufmax);
-    current->buf[current->bufmax - 1] = 0;
-    current->len = strlen(current->buf);
-    current->pos = current->chars = utf8_strlen(current->buf, current->len);
+    set_current_space_tail(current, str, 0, 0);
 }
 
 static int has_room(struct current *current, int bytes)
@@ -1071,11 +1277,33 @@ static void freeCompletions(linenoiseCompletions *lc) {
     free(lc->cvec);
 }
 
+#define COMPLETE_SPACE_OPT 0
+
 static int completeLine(struct current *current) {
     linenoiseCompletions lc = { 0, NULL };
     int c = 0;
+    char *tail = 0;
+    char *tmpBuf = 0;
+    int tailIndex = 0;
+    int tailLen = 0;
 
-    completionCallback(current->buf,&lc);
+    if (current->pos != current->chars) {
+        tailIndex = utf8_index(current->buf, current->pos);
+        tail = strdup(current->buf + tailIndex);
+        /* cut off tail for completion */
+        current->buf[tailIndex] = 0;
+    }
+
+    disableRawMode(current);
+    lineEditModeCritical_Leave();
+    completionCallback(current->buf, &lc);
+    lineEditModeCritical_Enter();
+    enableRawMode(current);
+
+    if (tail) {
+        /* put back cut-off tail */
+        current->buf[tailIndex] = *tail;
+    }
     if (lc.len == 0) {
         beep();
     } else {
@@ -1086,9 +1314,29 @@ static int completeLine(struct current *current) {
             if (i < lc.len) {
                 struct current tmp = *current;
                 tmp.buf = lc.cvec[i];
-                tmp.pos = tmp.len = strlen(tmp.buf);
-                tmp.chars = utf8_strlen(tmp.buf, tmp.len);
+                tmp.bufmax = strlen(tmp.buf) + 1;
+                if (tail)
+                {
+                    if (!tailLen)
+                        tailLen = strlen(tail);
+
+                    tmp.bufmax += tailLen + 1;
+                    tmp.buf = (char*) malloc(tmp.bufmax);
+
+                    set_current_space_tail(&tmp, lc.cvec[i], COMPLETE_SPACE_OPT, tail);
+
+                    if (tmpBuf)
+                        free(tmpBuf);
+                    tmpBuf = tmp.buf;
+                }
+                else
+                {
+                    tmp.len = strlen(tmp.buf);
+                    tmp.pos = tmp.chars = utf8_strlen(tmp.buf, tmp.len);
+                }
+
                 refreshLine(current->prompt, &tmp);
+
             } else {
                 refreshLine(current->prompt, current);
             }
@@ -1104,22 +1352,39 @@ static int completeLine(struct current *current) {
                     if (i == lc.len) beep();
                     break;
                 case 27: /* escape */
-                    /* Re-show original buffer */
-                    if (i < lc.len) {
-                        refreshLine(current->prompt, current);
+#ifdef USE_TERMIOS
+                    c = check_special(current->fd);
+#endif
+                    switch (c)
+                    {
+                        case 27:
+                            /* Re-show original buffer */
+                            if (i < lc.len) {
+                                refreshLine(current->prompt, current);
+                            }
+                            stop = 1;
+                            c = 0;
+                            break;
+                        default:
+                            goto next;
                     }
-                    stop = 1;
                     break;
                 default:
+                    next:
                     /* Update buffer and return */
                     if (i < lc.len) {
-                        set_current(current,lc.cvec[i]);
+                        set_current_space_tail(current,lc.cvec[i], COMPLETE_SPACE_OPT, tail);
+                        updateLineEditingMode(current->prompt, current);
                     }
                     stop = 1;
                     break;
             }
         }
     }
+    if (tail)
+        free(tail);
+    if (tmpBuf)
+        free(tmpBuf);
 
     freeCompletions(&lc);
     return c; /* Return last read character */
@@ -1159,10 +1424,13 @@ static int linenoiseEdit(struct current *current) {
         /* Only autocomplete when the callback is set. It returns < 0 when
          * there was an error reading from fd. Otherwise it will return the
          * character that should be handled next. */
-        if (c == '\t' && current->pos == current->chars && completionCallback != NULL) {
+        if (c == '\t' && /* current->pos == current->chars  && */ completionCallback != NULL) {
             c = completeLine(current);
             /* Return on errors */
-            if (c < 0) return current->len;
+            if (c == -1) {
+                updateLineEditingMode(0, 0);
+                return current->len;
+            }
             /* Read next character when 0 */
             if (c == 0) continue;
         }
@@ -1177,8 +1445,10 @@ process_char:
 #endif
         switch(c) {
         case '\r':    /* enter */
+            historyCritical_Enter();
             history_len--;
             free(history[history_len]);
+            historyCritical_Leave();
             return current->len;
         case ctrl('C'):     /* ctrl-c */
             errno = EAGAIN;
@@ -1192,8 +1462,10 @@ process_char:
         case ctrl('D'):     /* ctrl-d */
             if (current->len == 0) {
                 /* Empty line, so EOF */
+                historyCritical_Enter();
                 history_len--;
                 free(history[history_len]);
+                historyCritical_Leave();
                 return -1;
             }
             /* Otherwise fall through to delete char to right of cursor */
@@ -1233,6 +1505,8 @@ process_char:
                 int rchars = 0;
                 int rlen = 0;
                 int searchpos = history_len - 1;
+
+                historyCritical_Enter();
 
                 rbuf[0] = 0;
                 while (1) {
@@ -1321,6 +1595,9 @@ process_char:
                     /* ctrl-j terminates the search leaving the buffer in place */
                     c = 0;
                 }
+
+                historyCritical_Leave();
+
                 /* Go process the char normally */
                 refreshLine(current->prompt, current);
                 goto process_char;
@@ -1369,17 +1646,21 @@ process_char:
             }
             break;
         case SPECIAL_PAGE_UP:
+          historyCritical_Enter();
           dir = history_len - history_index - 1; /* move to start of history */
           goto history_navigation;
         case SPECIAL_PAGE_DOWN:
+          historyCritical_Enter();
           dir = -history_index; /* move to 0 == end of history, i.e. current */
           goto history_navigation;
         case ctrl('P'):
         case SPECIAL_UP:
-            dir = 1;
+          historyCritical_Enter();
+          dir = 1;
           goto history_navigation;
         case ctrl('N'):
         case SPECIAL_DOWN:
+            historyCritical_Enter();
 history_navigation:
             if (history_len > 1) {
                 /* Update the current history entry before to
@@ -1390,14 +1671,17 @@ history_navigation:
                 history_index += dir;
                 if (history_index < 0) {
                     history_index = 0;
+                    historyCritical_Leave();
                     break;
                 } else if (history_index >= history_len) {
                     history_index = history_len - 1;
+                    historyCritical_Leave();
                     break;
                 }
                 set_current(current, history[history_len - 1 - history_index]);
                 refreshLine(current->prompt, current);
             }
+            historyCritical_Leave();
             break;
         case ctrl('A'): /* Ctrl+a, go to the start of the line */
         case SPECIAL_HOME:
@@ -1480,7 +1764,10 @@ char *linenoise(const char *prompt)
         current.prompt = prompt;
         current.capture = NULL;
 
+        lineEditModeCritical_Enter();
+        errno = 0;
         count = linenoiseEdit(&current);
+        lineEditModeCritical_Leave();
 
         disableRawMode(&current);
         printf("\n");
@@ -1498,19 +1785,29 @@ int linenoiseHistoryAdd(const char *line) {
     char *linecopy;
 
     if (history_max_len == 0) return 0;
+
+    historyCritical_Enter();
+
     if (history == NULL) {
         history = (char **)malloc(sizeof(char*)*history_max_len);
-        if (history == NULL) return 0;
+        if (history == NULL) {
+            historyCritical_Leave();
+            return 0;
+        }
         memset(history,0,(sizeof(char*)*history_max_len));
     }
 
     /* do not insert duplicate lines into history */
     if (history_len > 0 && strcmp(line, history[history_len - 1]) == 0) {
+        historyCritical_Leave();
         return 0;
     }
 
     linecopy = strdup(line);
-    if (!linecopy) return 0;
+    if (!linecopy) {
+        historyCritical_Leave();
+        return 0;
+    }
     if (history_len == history_max_len) {
         free(history[0]);
         memmove(history,history+1,sizeof(char*)*(history_max_len-1));
@@ -1518,22 +1815,29 @@ int linenoiseHistoryAdd(const char *line) {
     }
     history[history_len] = linecopy;
     history_len++;
+    historyCritical_Leave();
     return 1;
 }
 
 int linenoiseHistoryGetMaxLen(void) {
+    historyCritical_Enter();
     return history_max_len;
+    historyCritical_Leave();
 }
 
 int linenoiseHistorySetMaxLen(int len) {
     char **newHistory;
 
     if (len < 1) return 0;
+    historyCritical_Enter();
     if (history) {
         int tocopy = history_len;
 
         newHistory = (char **)malloc(sizeof(char*)*len);
-        if (newHistory == NULL) return 0;
+        if (newHistory == NULL) {
+            historyCritical_Leave();
+            return 0;
+        }
 
         /* If we can't copy everything, free the elements we'll not use. */
         if (len < tocopy) {
@@ -1550,6 +1854,8 @@ int linenoiseHistorySetMaxLen(int len) {
     history_max_len = len;
     if (history_len > history_max_len)
         history_len = history_max_len;
+
+    historyCritical_Leave();
     return 1;
 }
 
@@ -1560,6 +1866,9 @@ int linenoiseHistorySave(const char *filename) {
     int j;
 
     if (fp == NULL) return -1;
+
+    historyCritical_Enter();
+
     for (j = 0; j < history_len; j++) {
         const char *str = history[j];
         /* Need to encode backslash, nl and cr */
@@ -1582,6 +1891,8 @@ int linenoiseHistorySave(const char *filename) {
     }
 
     fclose(fp);
+
+    historyCritical_Leave();
     return 0;
 }
 
@@ -1638,3 +1949,343 @@ char **linenoiseHistory(int *len) {
     }
     return history;
 }
+
+/*  */
+struct previous_mode
+{
+    int rawmode;
+    const char *prompt;
+    const char *buf;
+#if defined(USE_TERMIOS)
+    int fd;     /* Terminal fd */
+    struct termios raw_termios;
+#elif defined(USE_WINCONSOLE)
+    HANDLE outh; /* Console output handle */
+    HANDLE inh; /* Console input handle */
+    DWORD raw_consolemode;
+#endif
+};
+
+static int enableOriginalMode(struct previous_mode *mode) {
+    mode->rawmode = 0;
+    if (line_editing_mode.rawmode) {
+#if defined(USE_TERMIOS)
+        mode->fd = STDIN_FILENO;
+        if (tcgetattr(mode->fd, &mode->raw_termios) == -1)
+            return -1;
+        if (tcsetattr(mode->fd, TCSADRAIN, &orig_termios) == -1)
+            return -1;
+#elif defined(USE_WINCONSOLE)
+        mode->outh = GetStdHandle(STD_OUTPUT_HANDLE);
+        mode->inh = GetStdHandle(STD_INPUT_HANDLE);
+
+        if (!GetConsoleMode(mode->inh, &mode->raw_consolemode))
+            return -1;
+
+        SetConsoleMode(mode->inh, orig_consolemode);
+#endif
+        mode->rawmode = 1;
+
+        if (line_editing_mode.current) {
+            cursorToLeft(line_editing_mode.current);
+            eraseEol(line_editing_mode.current);
+        }
+    }
+    return 0;
+}
+
+static int disableOriginalMode(struct previous_mode *mode) {
+    if (mode->rawmode) {
+#if defined(USE_TERMIOS)
+        if (tcsetattr(mode->fd, TCSADRAIN, &mode->raw_termios) == -1)
+            return -1;
+#elif defined(USE_WINCONSOLE)
+        if (!SetConsoleMode(mode->inh, mode->raw_consolemode))
+            return -1;
+#endif
+        if (line_editing_mode.prompt && line_editing_mode.current)
+            refreshLine(line_editing_mode.prompt, line_editing_mode.current);
+    }
+    return 0;
+}
+
+static const char CRLF[2] = {'\r','\n'};
+
+static struct linenoiseTextAttr promptAttrCopy;
+
+void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr)
+{
+    if (!textAttr) {
+        promptAttr = 0;
+        return;
+    }
+    memcpy(&promptAttrCopy, textAttr, sizeof(promptAttrCopy));
+    promptAttr = &promptAttrCopy;
+}
+
+#if !defined (USE_WINCONSOLE)
+
+static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
+{
+    char buf[32];
+    int pos;
+    if (!isatty(fd))
+        return -1;
+    pos = sprintf(buf, "\x1b[0");
+    if (textAttr != NULL) {
+        if (textAttr->has_fg) {
+            if (textAttr->fg_color >= 0 && textAttr->fg_color <= 7) {
+                int fg;
+                fg = textAttr->fg_color + 30;
+                pos += sprintf(buf + pos, ";%d", fg);
+            }
+        }
+        if (textAttr->bold_fg) {
+            pos += sprintf(buf + pos, ";%d", 1);
+        }
+        if (textAttr->has_bg) {
+            if (textAttr->bg_color >= 0 && textAttr->bg_color <= 7) {
+                int bg;
+                bg = textAttr->bg_color + 40;
+                pos += sprintf(buf + pos, ";%d", bg);
+            }
+        }
+        if (textAttr->invert_bg_fg) {
+            pos += sprintf(buf + pos, ";%d", 7);
+        }
+    }
+    pos += sprintf(buf + pos, "m");
+    write(fd, buf, pos);
+    return 0;
+}
+
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr)
+{
+    int res;
+    if (attr != NULL) {
+        res = setTextAttr(current->fd, attr);
+        if (res != 0)
+            attr = NULL;
+    }
+    res = outputChars(current, buf, len);
+    if (attr != NULL)
+        setTextAttr(current->fd, 0);
+    return res;
+}
+
+static void printLineFromStart(int fd, const char *line, struct linenoiseTextAttr *textAttr) {
+    struct previous_mode mode;
+    size_t len;
+    int res;
+    len = strlen(line);
+    lineEditModeCritical_Enter();
+    if (!line_editing_mode.current)
+        write(fd, &CRLF, 1);
+
+    res = enableOriginalMode(&mode);
+    if (res != 0)
+        textAttr = NULL;
+
+    if (textAttr != NULL)
+        setTextAttr(fd, textAttr);
+
+    write(fd, line, len);
+
+    if (textAttr != NULL)
+        setTextAttr(fd, NULL);
+
+    write(fd, &CRLF, 2);
+    fsync(fd);
+    disableOriginalMode(&mode);
+    lineEditModeCritical_Leave();
+}
+
+void linenoisePrintLine(const char *line, struct linenoiseTextAttr *textAttr) {
+    printLineFromStart(STDOUT_FILENO, line, textAttr);
+}
+
+void linenoiseErrorLine(const char *line, struct linenoiseTextAttr *textAttr) {
+    printLineFromStart(STDERR_FILENO, line, textAttr);
+}
+
+void linenoiseCancel()
+{
+    static const char tmp[] = {0};
+    write(interrupt_pipe[1], tmp, 1);
+}
+
+int linenoiseWinSize(int *columns, int *rows)
+{
+    struct winsize ws;
+    int result;
+
+    lineEditModeCritical_Enter();
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (columns)
+            *columns = ws.ws_col;
+        if (rows)
+            *rows = ws.ws_row;
+        result = 0;
+    } else {
+        result = -1;
+    }
+
+    lineEditModeCritical_Leave();
+
+    return result;
+}
+
+#else
+
+#define FOREGROUND_DEFAULT FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED
+#define BACKGROUND_DEFAULT 0
+
+static int setTextAttr(HANDLE handle, struct linenoiseTextAttr *textAttr)
+{
+    WORD attributes;
+
+    if (!textAttr) {
+        if (SetConsoleTextAttribute(handle, FOREGROUND_DEFAULT | BACKGROUND_DEFAULT)) {
+            return 0;
+        }
+        return -1;
+    }
+    attributes = 0;
+    if (textAttr->has_fg && textAttr->fg_color >= 0 && textAttr->fg_color <= 7)
+    {
+        int fg;
+        fg = textAttr->fg_color;
+        if (fg & 1)
+            attributes |= FOREGROUND_RED;
+        if (fg & 2)
+            attributes |= FOREGROUND_GREEN;
+        if (fg & 4)
+            attributes |= FOREGROUND_BLUE;
+    }
+    else
+    {
+        attributes |= FOREGROUND_DEFAULT;
+    }
+    if (textAttr->bold_fg)
+        attributes |= FOREGROUND_INTENSITY;
+
+    if (textAttr->has_bg & textAttr->bg_color >= 0 && textAttr->bg_color <= 7)
+    {
+        int bg;
+        bg = textAttr->bg_color;
+        if (bg & 1)
+            attributes |= BACKGROUND_RED;
+        if (bg & 2)
+            attributes |= BACKGROUND_GREEN;
+        if (bg & 4)
+            attributes |= BACKGROUND_BLUE;
+    }
+    else
+    {
+        attributes |= BACKGROUND_DEFAULT;
+    }
+    if (textAttr->invert_bg_fg)
+    {
+        attributes |= COMMON_LVB_REVERSE_VIDEO;
+    }
+
+    if (SetConsoleTextAttribute(handle, attributes)) {
+        return 0;
+    }
+    return -1;
+}
+
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr)
+{
+    int res;
+    if (attr != NULL) {
+        res = setTextAttr(current->outh, attr);
+        if (res != 0)
+            attr = NULL;
+    }
+    res = outputChars(current, buf, len);
+    if (attr != NULL)
+        setTextAttr(current->outh, 0);
+
+    return res;
+}
+
+static void printLineFromStart(HANDLE handle, const char *line, struct linenoiseTextAttr *textAttr) {
+    struct previous_mode mode;
+    size_t len;
+    int res;
+    DWORD dummy;
+    len = strlen(line);
+    lineEditModeCritical_Enter();
+    WriteFile(handle, CRLF, 1, &dummy, 0);
+    res = enableOriginalMode(&mode);
+    if (res != 0)
+        textAttr = 0;
+
+    if (textAttr)
+        setTextAttr(handle, textAttr);
+
+    WriteFile(handle, line, len, &dummy, 0);
+
+    if (textAttr)
+        setTextAttr(handle, 0);
+
+    WriteFile(handle, CRLF, 2, &dummy, 0);
+
+    disableOriginalMode(&mode);
+    lineEditModeCritical_Leave();
+}
+
+void linenoiseCancel()
+{
+    if (interruptEvent != 0)
+        SetEvent(interruptEvent);
+}
+
+void linenoisePrintLine(const char *line, struct linenoiseTextAttr *textAttr) {
+    printLineFromStart(GetStdHandle(STD_OUTPUT_HANDLE), line, textAttr);
+}
+
+void linenoiseErrorLine(const char *line, struct linenoiseTextAttr *textAttr) {
+    printLineFromStart(GetStdHandle(STD_ERROR_HANDLE), line, textAttr);
+}
+
+int linenoiseWinSize(int *columns, int *rows)
+{
+    struct current current;
+    int result;
+    current.outh = GetStdHandle(STD_OUTPUT_HANDLE);
+    result = getWindowSize (&current);
+    if (columns)
+        *columns = current.cols;
+    if (rows)
+        *rows = current.rows;
+    return result;
+}
+
+#endif
+
+#ifdef USE_OWN_STRDUP
+// multi-threaded strdup is broken in glibc-2.19 x64
+static char *_strdup(const char * str)
+{
+    size_t len;
+    size_t malloclen;
+    char * ptr;
+    
+    len = strlen(str) + 1;
+    malloclen = !(len % 16) ? len :
+        len + 16 - (len % 16);
+
+    ptr = (char*) malloc(malloclen);
+
+    if (!ptr)
+        return ptr;
+
+    memcpy(ptr, str, malloclen);
+    ptr[len] = 0;
+
+    return ptr;
+}
+#endif

@@ -117,4 +117,47 @@ char **linenoiseHistory(int *len);
  */
 int linenoiseColumns(void);
 
+struct linenoiseTextAttr
+{
+    int has_fg;
+    int fg_color; // 0 to 7, -1 default
+    int bold_fg;
+
+    int has_bg;
+    int bg_color; // -1 default
+    int invert_bg_fg;
+};
+
+/**
+ *  set prompt color
+ */
+void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr);
+
+#ifdef __cplusplus
+#define LINENOISE_DEFAULT_ARG(arg, value) arg = value
+#else
+#define LINENOISE_DEFAULT_ARG(arg, value) arg
+#endif
+
+/**
+ *  Allows printing while line editing is being done
+ */
+void linenoisePrintLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr *textAttr, 0));
+
+/**
+ *  Allows printing while line editing is being done
+ */
+void linenoiseErrorLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr *textAttr, 0));
+
+/**
+ *  Interrupt current line editing operation
+ */
+void linenoiseCancel();
+
+
+/**
+ *  Get console size
+ */
+int linenoiseWinSize(int *columns, int *rows);
+
 #endif /* __LINENOISE_H */
