@@ -147,6 +147,7 @@
 #include <pthread.h>
 #endif
 
+#include <ctype.h>
 #include <assert.h>
 
 #ifdef USE_OWN_STRDUP
@@ -667,6 +668,20 @@ static int check_special(int fd)
                 case '8':
                     return SPECIAL_END;
             }
+        } else if (c == ';') {
+            switch (c2) {
+                case '1':
+                    c = fd_read_char(fd, 50);
+                    if (c == '5') {
+                        c2 = fd_read_char(fd, 50);
+                        switch (c2) {
+                        case 'C':
+                            return ctrl(SPECIAL_RIGHT);
+                        case 'D':
+                            return ctrl(SPECIAL_LEFT);
+                    }
+                }
+            }
         }
         while (c != -1 && c != '~') {
             /* .e.g \e[12~ or '\e[11;2~   discard the complete sequence */
@@ -772,6 +787,19 @@ static void ensureInterruptEvent()
         interruptEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
 }
 
+static int getControlState(KEY_EVENT_RECORD *k)
+{
+    return k->dwControlKeyState & (
+        LEFT_ALT_PRESSED | LEFT_CTRL_PRESSED |
+        RIGHT_ALT_PRESSED | RIGHT_CTRL_PRESSED |
+        SHIFT_PRESSED);
+}
+
+static int controlStateIsOnlyAnyOf(KEY_EVENT_RECORD *k, int anyOf)
+{
+    int state = getControlState(k);
+    return (state & anyOf) && !(state & ~anyOf);
+}
 
 static int fd_read(struct current *current)
 {
@@ -795,11 +823,7 @@ static int fd_read(struct current *current)
         lineEditModeCritical_Enter();
         if (irec.EventType == KEY_EVENT && irec.Event.KeyEvent.bKeyDown) {
             KEY_EVENT_RECORD *k = &irec.Event.KeyEvent;
-            if ((k->dwControlKeyState & ( 
-                LEFT_ALT_PRESSED | LEFT_CTRL_PRESSED |
-                RIGHT_ALT_PRESSED | RIGHT_CTRL_PRESSED |
-                SHIFT_PRESSED
-            )) == 0) {
+            if (getControlState(k) == 0) {
                 switch (k->wVirtualKeyCode) {
                 case VK_LEFT:
                     return SPECIAL_LEFT;
@@ -826,6 +850,13 @@ static int fd_read(struct current *current)
                 case VK_BACK:
                 case VK_RETURN:
                     return k->uChar.AsciiChar;
+                }
+            } else if (controlStateIsOnlyAnyOf(k, LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {
+                switch (k->wVirtualKeyCode) {
+                case VK_LEFT:
+                    return ctrl(SPECIAL_LEFT);
+                case VK_RIGHT:
+                    return ctrl(SPECIAL_RIGHT);
                 }
             }
             if (k->dwControlKeyState & ENHANCED_KEY) {
@@ -870,6 +901,9 @@ static int getWindowSize(struct current *current)
 }
 
 #endif
+
+static void goLeftToStartOfWord(struct current *current);
+static void goRightToEndOfWord(struct current *current);
 
 static int utf8_getchars(char *buf, int c)
 {
@@ -1468,8 +1502,9 @@ process_char:
                 historyCritical_Leave();
                 return -1;
             }
+            goto SpecialDelete;
             /* Otherwise fall through to delete char to right of cursor */
-        case SPECIAL_DELETE:
+        case SPECIAL_DELETE: SpecialDelete:
             if (remove_char(current, current->pos) == 1) {
                 refreshLine(current->prompt, current);
             }
@@ -1638,12 +1673,20 @@ process_char:
                 refreshLine(current->prompt, current);
             }
             break;
+        case ctrl(SPECIAL_LEFT):
+            goLeftToStartOfWord(current);
+            refreshLine(current->prompt, current);
+            break;
         case ctrl('F'):
         case SPECIAL_RIGHT:
             if (current->pos < current->chars) {
                 current->pos++;
                 refreshLine(current->prompt, current);
             }
+            break;
+        case ctrl(SPECIAL_RIGHT):
+            goRightToEndOfWord(current);
+            refreshLine(current->prompt, current);
             break;
         case SPECIAL_PAGE_UP:
           historyCritical_Enter();
@@ -2265,6 +2308,44 @@ int linenoiseWinSize(int *columns, int *rows)
 }
 
 #endif
+
+static int isWordChar(int ch)
+{
+    return isalnum(ch);
+}
+
+static void goLeftToStartOfWord(struct current *current)
+{
+    if (!current->buf)
+        return;
+
+    if (current->pos == 0)
+        return;
+
+    current->pos--;
+
+    while (current->pos > 0 && !isWordChar(get_char(current, current->pos))) {
+        current->pos--;
+    }
+
+    while (current->pos > 0 && isWordChar(get_char(current, current->pos-1))) {
+        current->pos--;
+    }
+}
+static void goRightToEndOfWord(struct current *current)
+{
+    if (!current->buf)
+        return;
+
+    while (current->pos < current->chars && !isWordChar(get_char(current, current->pos))) {
+        current->pos++;
+    }
+
+    while (current->pos < current->chars && isWordChar(get_char(current, current->pos))) {
+        current->pos++;
+    }
+}
+
 
 #ifdef USE_OWN_STRDUP
 // multi-threaded strdup is broken in glibc-2.19 x64
