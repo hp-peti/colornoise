@@ -116,8 +116,10 @@
 #define HAVE_UNISTD_H
 #else
 /* Microsoft headers don't like old POSIX names */
+#if defined(_MSC_VER) && _MSC_VER < 1900
 #define strdup _strdup
 #define snprintf _snprintf
+#endif
 #endif
 #else
 #include <termios.h>
