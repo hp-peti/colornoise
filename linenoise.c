@@ -2357,17 +2357,17 @@ static char *_strdup(const char * str)
     size_t malloclen;
     char * ptr;
     
-    len = strlen(str) + 1;
-    malloclen = !(len % 16) ? len :
-        len + 16 - (len % 16);
+    len = strlen(str);
+    malloclen = len + 1;
+    if (malloclen % 16)
+        malloclen += 16 - (malloclen % 16);
 
     ptr = (char*) malloc(malloclen);
 
     if (!ptr)
         return ptr;
 
-    memcpy(ptr, str, malloclen);
-    ptr[len] = 0;
+    memcpy(ptr, str, len + 1);
 
     return ptr;
 }
