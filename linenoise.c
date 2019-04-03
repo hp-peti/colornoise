@@ -393,7 +393,7 @@ static int fd_read_char(int fd, int timeout)
     p[1].events = POLLIN;
     p[1].revents = 0;
 
-    if (poll(&p, 2, timeout) == 0) {
+    if (poll(p, 2, timeout) == 0) {
         /* timeout */
         return -1;
     }
@@ -1440,7 +1440,7 @@ linenoiseCompletionCallback * linenoiseSetCompletionCallback(linenoiseCompletion
 }
 
 void linenoiseAddCompletion(linenoiseCompletions *lc, const char *str) {
-    void *nvec = (char **)realloc(lc->cvec,sizeof(char*)*(lc->len+1));
+    char **nvec = (char **)realloc(lc->cvec,sizeof(char*)*(lc->len+1));
     if (nvec == NULL)
         return;
     lc->cvec = nvec;
