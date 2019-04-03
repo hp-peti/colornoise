@@ -668,8 +668,10 @@ static int check_special(int fd)
                 case '6':
                     return SPECIAL_PAGE_DOWN;
                 case '7':
+                case '1': /* This version is used by screen/tmux */
                     return SPECIAL_HOME;
                 case '8':
+                case '4': /* This version is used by screen/tmux */
                     return SPECIAL_END;
             }
         } else if (c == ';') {
