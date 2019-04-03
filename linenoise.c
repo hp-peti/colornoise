@@ -388,8 +388,10 @@ static int fd_read_char(int fd, int timeout)
 
     p[0].fd = fd;
     p[0].events = POLLIN;
+    p[0].revents = 0;
     p[1].fd = interrupt_pipe[0];
     p[1].events = POLLIN;
+    p[1].revents = 0;
 
     if (poll(&p, 2, timeout) == 0) {
         /* timeout */
@@ -1251,8 +1253,10 @@ static void capture_chars(struct current *current, int pos, int n)
             free(current->capture);
             /* Include space for the null terminator */
             current->capture = (char *)malloc(nbytes + 1);
-            memcpy(current->capture, current->buf + p1, nbytes);
-            current->capture[nbytes] = '\0';
+            if (current->capture) {
+                memcpy(current->capture, current->buf + p1, nbytes);
+                current->capture[nbytes] = '\0';
+            }
         }
     }
 }
@@ -1436,7 +1440,10 @@ linenoiseCompletionCallback * linenoiseSetCompletionCallback(linenoiseCompletion
 }
 
 void linenoiseAddCompletion(linenoiseCompletions *lc, const char *str) {
-    lc->cvec = (char **)realloc(lc->cvec,sizeof(char*)*(lc->len+1));
+    void *nvec = (char **)realloc(lc->cvec,sizeof(char*)*(lc->len+1));
+    if (nvec == NULL)
+        return;
+    lc->cvec = nvec;
     lc->cvec[lc->len++] = strdup(str);
 }
 
@@ -1554,7 +1561,9 @@ process_char:
 
                     snprintf(rprompt, sizeof(rprompt), "(reverse-i-search)'%s': ", rbuf);
                     refreshLine(rprompt, current);
+                    historyCritical_Leave();
                     c = fd_read(current);
+                    historyCritical_Enter();
                     if (c == ctrl('H') || c == 127) {
                         if (rchars) {
                             int p = utf8_index(rbuf, --rchars);
@@ -1865,9 +1874,11 @@ int linenoiseHistoryAdd(const char *line) {
 }
 
 int linenoiseHistoryGetMaxLen(void) {
+    int len;
     historyCritical_Enter();
-    return history_max_len;
+    len = history_max_len;
     historyCritical_Leave();
+    return len;
 }
 
 int linenoiseHistorySetMaxLen(int len) {
@@ -2061,10 +2072,10 @@ static struct linenoiseTextAttr promptAttrCopy;
 void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr)
 {
     if (!textAttr) {
-        promptAttr = 0;
+        promptAttr = NULL;
         return;
     }
-    memcpy(&promptAttrCopy, textAttr, sizeof(promptAttrCopy));
+    promptAttrCopy = *textAttr;
     promptAttr = &promptAttrCopy;
 }
 
@@ -2076,7 +2087,7 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
     int pos;
     if (!isatty(fd))
         return -1;
-    pos = sprintf(buf, "\x1b[0");
+    pos = snprintf(buf, 32, "\x1b[0");
     if (textAttr != NULL) {
         if (textAttr->has_fg) {
             if (textAttr->fg_color >= 0 && textAttr->fg_color <= 7) {
@@ -2092,14 +2103,14 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
             if (textAttr->bg_color >= 0 && textAttr->bg_color <= 7) {
                 int bg;
                 bg = textAttr->bg_color + 40;
-                pos += sprintf(buf + pos, ";%d", bg);
+                pos += snprintf(buf + pos, 32 - pos, ";%d", bg);
             }
         }
         if (textAttr->invert_bg_fg) {
-            pos += sprintf(buf + pos, ";%d", 7);
+            pos += snprintf(buf + pos, 32 - pos, ";%d", 7);
         }
     }
-    pos += sprintf(buf + pos, "m");
+    pos += snprintf(buf + pos, 32 - pos, "m");
     write(fd, buf, pos);
     return 0;
 }
