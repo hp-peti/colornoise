@@ -1489,7 +1489,8 @@ process_char:
         }
 #endif
         switch(c) {
-        case '\r':    /* enter */
+        case '\n':    /* enter received while the console is busy */
+        case '\r':    /* enter received in raw mode while the console is ready */
             historyCritical_Enter();
             history_len--;
             free(history[history_len]);
