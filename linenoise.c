@@ -246,6 +246,26 @@ static int atexit_registered = 0; /* register atexit just 1 time */
 
 static const char *unsupported_term[] = {"dumb","cons25",NULL};
 
+static int is256ColorTerm() {
+    char *term = getenv("TERM");
+    if (term) {
+        if (strstr(term,"256color"))
+            return 1;
+    }
+    return 0;
+}
+
+static int is256ColorTerm_cached() {
+    static int saved = 0;
+    static int value = 0;
+    if (saved == 0) {
+        value = is256ColorTerm();
+        saved = 1;
+    }
+    return value;
+}
+
+
 static int isUnsupportedTerm(void) {
     char *term = getenv("TERM");
 
@@ -2095,7 +2115,9 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
         if (textAttr->has_fg) {
             if (textAttr->fg_color >= 0 && textAttr->fg_color <= 7) {
                 int fg;
-                fg = textAttr->fg_color + 30;
+                fg = textAttr->fg_color + (
+                    !textAttr->bold_fg || !is256ColorTerm_cached() ? 30 : 90
+                );
                 pos += sprintf(buf + pos, ";%d", fg);
             }
         }
