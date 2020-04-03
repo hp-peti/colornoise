@@ -161,7 +161,7 @@ int linenoiseWinSize(int *columns, int *rows);
 
 struct linenoiseTextWithAttr {
     const char *text;
-    struct linenoiseTextAttr const *attr;
+    struct linenoiseTextAttr const * attr;
 };
 
 /**

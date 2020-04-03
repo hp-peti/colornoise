@@ -223,7 +223,7 @@ static void updateLineEditingMode(const char *prompt, struct current *current);
 static int fd_read(struct current *current);
 static int getWindowSize(struct current *current);
 
-static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr);
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr const *attr);
 
 void linenoiseHistoryFree(void) {
     historyCritical_Enter();
@@ -2152,7 +2152,7 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
     return 0;
 }
 
-static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr)
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr const *attr)
 {
     int res;
     if (attr != NULL) {
@@ -2170,7 +2170,7 @@ static void printLineFromStart(int fd, const struct linenoiseTextWithAttr *textW
     struct previous_mode mode;
     int res;
     size_t i;
-    struct lineNoiseTextAttr const* textAttr;
+    struct linenoiseTextAttr const* textAttr;
 
     lineEditModeCritical_Enter();
     if (!line_editing_mode.current)
@@ -2259,11 +2259,11 @@ int linenoiseWinSize(int *columns, int *rows)
 #define FOREGROUND_DEFAULT FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED
 #define BACKGROUND_DEFAULT 0
 
-static int setTextAttr(HANDLE handle, struct linenoiseTextAttr *textAttr)
+static int setTextAttr(HANDLE handle, struct linenoiseTextAttr const * textAttr)
 {
     WORD attributes;
 
-    if (!textAttr) {
+    if (textAttr == NULL) {
         if (SetConsoleTextAttribute(handle, FOREGROUND_DEFAULT | BACKGROUND_DEFAULT)) {
             return 0;
         }
@@ -2314,7 +2314,7 @@ static int setTextAttr(HANDLE handle, struct linenoiseTextAttr *textAttr)
     return -1;
 }
 
-static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr *attr)
+static int outputCharsAttr(struct current *current, const char *buf, int len, struct linenoiseTextAttr const *attr)
 {
     int res;
     if (attr != NULL) {
@@ -2323,18 +2323,19 @@ static int outputCharsAttr(struct current *current, const char *buf, int len, st
             attr = NULL;
     }
     res = outputChars(current, buf, len);
+    
     if (attr != NULL)
         setTextAttr(current->outh, 0);
 
     return res;
 }
 
-static void printLineFromStart(HANDLE handle, const struct linenoiseTextWithAttr *textWithAttr, size_t n) {
+static void printLineFromStart(HANDLE handle, struct linenoiseTextWithAttr const *textWithAttr, size_t n) {
     struct previous_mode mode;
     int res;
     size_t i;
     DWORD dummy;
-    struct lineNoiseTextAttr const* textAttr;
+    struct linenoiseTextAttr const * textAttr;
 
     lineEditModeCritical_Enter();
     WriteFile(handle, CRLF, 1, &dummy, 0);
