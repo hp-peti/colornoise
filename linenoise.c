@@ -205,7 +205,7 @@ struct current {
 #endif
 };
 
-static struct linenoiseTextAttr *promptAttr = 0;
+static struct linenoiseTextAttr const *promptAttr = 0;
 
 #ifndef _WIN32
 static int interrupt_pipe[2] = { -1, -1 };
@@ -2104,7 +2104,7 @@ static const char CRLF[2] = {'\r','\n'};
 
 static struct linenoiseTextAttr promptAttrCopy;
 
-void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr)
+void linenoiseSetPromptAttr(struct linenoiseTextAttr const *textAttr)
 {
     if (!textAttr) {
         promptAttr = NULL;
@@ -2166,23 +2166,32 @@ static int outputCharsAttr(struct current *current, const char *buf, int len, st
     return res;
 }
 
-static void printLineFromStart(int fd, const char *line, struct linenoiseTextAttr *textAttr) {
+static void printLineFromStart(int fd, const struct linenoiseTextWithAttr *textWithAttr, size_t n) {
     struct previous_mode mode;
-    size_t len;
     int res;
-    len = strlen(line);
+    size_t i;
+    struct lineNoiseTextAttr const* textAttr;
+
     lineEditModeCritical_Enter();
     if (!line_editing_mode.current)
         write(fd, &CRLF, 1);
 
     res = enableOriginalMode(&mode);
-    if (res != 0)
-        textAttr = NULL;
 
-    if (textAttr != NULL)
-        setTextAttr(fd, textAttr);
-
-    write(fd, line, len);
+    textAttr = NULL;
+    for (int i = 0; i != n; ++i) {
+        if (res == 0) {
+            if (textWithAttr[i].attr != textAttr) {
+                textAttr = textWithAttr[i].attr;
+                setTextAttr(fd, textAttr);
+            }
+        }
+        if (textWithAttr[i].text != NULL) {
+            size_t len;
+            len = strlen(textWithAttr[i].text);
+            write(fd, textWithAttr[i].text, len);
+        }
+    }
 
     if (textAttr != NULL)
         setTextAttr(fd, NULL);
@@ -2193,12 +2202,28 @@ static void printLineFromStart(int fd, const char *line, struct linenoiseTextAtt
     lineEditModeCritical_Leave();
 }
 
-void linenoisePrintLine(const char *line, struct linenoiseTextAttr *textAttr) {
-    printLineFromStart(STDOUT_FILENO, line, textAttr);
+void linenoisePrintLine(const char *line, struct linenoiseTextAttr const * textAttr) {
+    const struct linenoiseTextWithAttr textWithAttr = {
+        line,
+        textAttr
+    };
+    printLineFromStart(STDOUT_FILENO, &textWithAttr, 1);
 }
 
-void linenoiseErrorLine(const char *line, struct linenoiseTextAttr *textAttr) {
-    printLineFromStart(STDERR_FILENO, line, textAttr);
+void linenoiseErrorLine(const char *line, struct linenoiseTextAttr const * textAttr) {
+    const struct linenoiseTextWithAttr textWithAttr = {
+        line,
+        textAttr
+    };
+    printLineFromStart(STDERR_FILENO, &textWithAttr, 1);
+}
+
+void linenoisePrintAttrLine(struct linenoiseTextWithAttr const * textWithAttr, size_t count) {
+    printLineFromStart(STDOUT_FILENO, textWithAttr, count);
+}
+
+void linenoiseErrorAttrLine(struct linenoiseTextWithAttr const * textWithAttr, size_t count) {
+    printLineFromStart(STDERR_FILENO, textWithAttr, count);
 }
 
 void linenoiseCancel()
@@ -2304,27 +2329,36 @@ static int outputCharsAttr(struct current *current, const char *buf, int len, st
     return res;
 }
 
-static void printLineFromStart(HANDLE handle, const char *line, struct linenoiseTextAttr *textAttr) {
+static void printLineFromStart(HANDLE handle, const struct linenoiseTextWithAttr *textWithAttr, size_t n) {
     struct previous_mode mode;
-    size_t len;
     int res;
+    size_t i;
     DWORD dummy;
-    len = strlen(line);
+    struct lineNoiseTextAttr const* textAttr;
+
     lineEditModeCritical_Enter();
     WriteFile(handle, CRLF, 1, &dummy, 0);
+
     res = enableOriginalMode(&mode);
-    if (res != 0)
-        textAttr = 0;
 
-    if (textAttr)
-        setTextAttr(handle, textAttr);
+    textAttr = NULL;
+    for (i = 0; i != n; ++i) {
+        if (res == 0) {
+            if (textWithAttr[i].attr != textAttr) {
+                textAttr = textWithAttr[i].attr;
+                setTextAttr(handle, textAttr);
+            }
+        }
+        if (textWithAttr[i].text != NULL) {
+            size_t len = strlen(textWithAttr[i].text);
+            WriteFile(handle, textWithAttr[i].text, len, &dummy, NULL);
+        }
+    }
 
-    WriteFile(handle, line, len, &dummy, 0);
+    if (textAttr != NULL)
+        setTextAttr(handle, NULL);
 
-    if (textAttr)
-        setTextAttr(handle, 0);
-
-    WriteFile(handle, CRLF, 2, &dummy, 0);
+    WriteFile(handle, CRLF, 2, &dummy, NULL);
 
     disableOriginalMode(&mode);
     lineEditModeCritical_Leave();
@@ -2336,12 +2370,28 @@ void linenoiseCancel()
         SetEvent(interruptEvent);
 }
 
-void linenoisePrintLine(const char *line, struct linenoiseTextAttr *textAttr) {
-    printLineFromStart(GetStdHandle(STD_OUTPUT_HANDLE), line, textAttr);
+void linenoisePrintLine(const char *line, struct linenoiseTextAttr const * textAttr) {
+    const struct linenoiseTextWithAttr textWithAttr = {
+        line,
+        textAttr
+    };
+    printLineFromStart(GetStdHandle(STD_OUTPUT_HANDLE), &textWithAttr, 1);
 }
 
-void linenoiseErrorLine(const char *line, struct linenoiseTextAttr *textAttr) {
-    printLineFromStart(GetStdHandle(STD_ERROR_HANDLE), line, textAttr);
+void linenoiseErrorLine(const char *line, struct linenoiseTextAttr const * textAttr) {
+    const struct linenoiseTextWithAttr textWithAttr = {
+        line,
+        textAttr
+    };
+    printLineFromStart(GetStdHandle(STD_ERROR_HANDLE), &textWithAttr, 1);
+}
+
+void linenoisePrintAttrLine(struct linenoiseTextWithAttr const * textWithAttr, size_t n) {
+    printLineFromStart(GetStdHandle(STD_OUTPUT_HANDLE), textWithAttr, n);
+}
+
+void linenoiseErrorAttrLine(struct linenoiseTextWithAttr const * textWithAttr, size_t n) {
+    printLineFromStart(GetStdHandle(STD_ERROR_HANDLE), textWithAttr, n);
 }
 
 int linenoiseWinSize(int *columns, int *rows)

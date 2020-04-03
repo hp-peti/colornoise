@@ -131,7 +131,7 @@ struct linenoiseTextAttr
 /**
  *  set prompt color
  */
-void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr);
+void linenoiseSetPromptAttr(struct linenoiseTextAttr const *textAttr);
 
 #ifdef __cplusplus
 #define LINENOISE_DEFAULT_ARG(arg, value) arg = value
@@ -142,22 +142,36 @@ void linenoiseSetPromptAttr(struct linenoiseTextAttr *textAttr);
 /**
  *  Allows printing while line editing is being done
  */
-void linenoisePrintLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr *textAttr, 0));
+void linenoisePrintLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr const * textAttr, 0));
 
 /**
  *  Allows printing while line editing is being done
  */
-void linenoiseErrorLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr *textAttr, 0));
+void linenoiseErrorLine(const char *line, LINENOISE_DEFAULT_ARG(struct linenoiseTextAttr const * textAttr, 0));
 
 /**
  *  Interrupt current line editing operation
  */
 void linenoiseCancel();
 
-
 /**
  *  Get console size
  */
 int linenoiseWinSize(int *columns, int *rows);
+
+struct linenoiseTextWithAttr {
+    const char *text;
+    struct linenoiseTextAttr const *attr;
+};
+
+/**
+ *  Allows printing while line editing is being done, multiple colors in single line
+ */
+void linenoisePrintAttrLine(const struct linenoiseTextWithAttr *textWithAttr, size_t n);
+
+/**
+ *  Allows printing while line editing is being done, multiple colors in single line
+ */
+void linenoiseErrorAttrLine(const struct linenoiseTextWithAttr *textWithAttr, size_t n);
 
 #endif /* __LINENOISE_H */
