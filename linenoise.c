@@ -176,7 +176,8 @@ enum {
     SPECIAL_END = -26,
     SPECIAL_INSERT = -27,
     SPECIAL_PAGE_UP = -28,
-    SPECIAL_PAGE_DOWN = -29
+    SPECIAL_PAGE_DOWN = -29,
+    SPECIAL_SHIFT_TAB = -30
 };
 
 static int history_max_len = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
@@ -672,6 +673,8 @@ static int check_special(int fd)
                 return SPECIAL_END;
             case 'H':
                 return SPECIAL_HOME;
+            case 'Z':
+                return SPECIAL_SHIFT_TAB;
         }
     }
     if (c == '[' && c2 >= '1' && c2 <= '8') {
@@ -884,10 +887,17 @@ static int fd_read(struct current *current)
                 case VK_RIGHT:
                     return ctrl(SPECIAL_RIGHT);
                 }
+            } else if (controlStateIsOnlyAnyOf(k, SHIFT_PRESSED)) {
+                switch (k->wVirtualKeyCode) {
+                case VK_TAB:
+                    return SPECIAL_SHIFT_TAB;
+                }
             }
             if (k->dwControlKeyState & ENHANCED_KEY) {
                 /* Note that control characters are already translated in AsciiChar */
             } else if (k->wVirtualKeyCode == VK_CONTROL) {
+                continue;
+            } else if (k->wVirtualKeyCode == VK_SHIFT) {
                 continue;
             } else {
 #ifdef USE_UTF8
@@ -1407,32 +1417,34 @@ static int completeLine(struct current *current) {
             if (c == -1) {
                 break;
             }
-
+#ifdef USE_TERMIOS
+            if (c == 27) {
+                c = check_special(current->fd);
+            }
+#endif
             switch(c) {
                 case '\t': /* tab */
                     i = (i+1) % (lc.len+1);
                     if (i == lc.len) beep();
                     break;
                 case 27: /* escape */
-#ifdef USE_TERMIOS
-                    c = check_special(current->fd);
-#endif
-                    switch (c)
-                    {
-                        case 27:
-                            /* Re-show original buffer */
-                            if (i < lc.len) {
-                                refreshLine(current->prompt, current);
-                            }
-                            stop = 1;
-                            c = 0;
-                            break;
-                        default:
-                            goto next;
+                    /* Re-show original buffer */
+                    if (i < lc.len) {
+                        refreshLine(current->prompt, current);
+                    }
+                    stop = 1;
+                    c = 0;
+                    break;
+                case SPECIAL_SHIFT_TAB:
+                    if (i == 0) {
+                        refreshLine(current->prompt, current);
+                        stop = 1;
+                        c = 0;
+                    } else {
+                        --i;
                     }
                     break;
                 default:
-                    next:
                     /* Update buffer and return */
                     if (i < lc.len) {
                         set_current_space_tail(current,lc.cvec[i], COMPLETE_SPACE_OPT, tail);
