@@ -163,6 +163,7 @@ static char *_strdup(const char * str);
 #define LINENOISE_MAX_LINE 4096
 
 #define ctrl(C) ((C) - '@')
+#define is_bright(x) ((unsigned)((x).has_fg) > 1)
 
 /* Use -ve numbers here to co-exist with normal unicode chars */
 enum {
@@ -2128,13 +2129,16 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
             if (textAttr->fg_color >= 0 && textAttr->fg_color <= 7) {
                 int fg;
                 fg = textAttr->fg_color + (
-                    !textAttr->bold_fg || !is256ColorTerm_cached() ? 30 : 90
+                    !textAttr->bold_fg && !is_bright(*textAttr) || !is256ColorTerm_cached() ? 30 : 90
                 );
                 pos += sprintf(buf + pos, ";%d", fg);
             }
         }
-        if (textAttr->bold_fg) {
+        if (textAttr->bold_fg || is_bright(*textAttr) && !is256ColorTerm_cached()) {
             pos += sprintf(buf + pos, ";%d", 1);
+        }
+        if (textAttr->underline){
+            pos += snprintf(buf + pos, 32 - pos, ";%d", 4);
         }
         if (textAttr->has_bg) {
             if (textAttr->bg_color >= 0 && textAttr->bg_color <= 7) {
@@ -2285,7 +2289,7 @@ static int setTextAttr(HANDLE handle, struct linenoiseTextAttr const * textAttr)
     {
         attributes |= FOREGROUND_DEFAULT;
     }
-    if (textAttr->bold_fg)
+    if (textAttr->bold_fg || is_bright(*textAttr))
         attributes |= FOREGROUND_INTENSITY;
 
     if (textAttr->has_bg & textAttr->bg_color >= 0 && textAttr->bg_color <= 7)
@@ -2306,6 +2310,10 @@ static int setTextAttr(HANDLE handle, struct linenoiseTextAttr const * textAttr)
     if (textAttr->invert_bg_fg)
     {
         attributes |= COMMON_LVB_REVERSE_VIDEO;
+    }
+    if (textAttr->underline)
+    {
+        attributes |= COMMON_LVB_UNDERSCORE;
     }
 
     if (SetConsoleTextAttribute(handle, attributes)) {

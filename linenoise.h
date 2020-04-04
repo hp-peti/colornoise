@@ -119,13 +119,15 @@ int linenoiseColumns(void);
 
 struct linenoiseTextAttr
 {
-    int has_fg;
+    int has_fg;   // 0 default, 1 normal, >1|<0 bright
     int fg_color; // 0 to 7, -1 default
     int bold_fg;
 
     int has_bg;
     int bg_color; // -1 default
     int invert_bg_fg;
+
+    int underline;
 };
 
 /**
