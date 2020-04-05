@@ -257,7 +257,7 @@ static int is256ColorTerm() {
     return 0;
 }
 
-static int is256ColorTerm_cached() {
+static int is256ColorTerm_cached_value() {
     static int saved = 0;
     static int value = 0;
     if (saved == 0) {
@@ -266,7 +266,6 @@ static int is256ColorTerm_cached() {
     }
     return value;
 }
-
 
 static int isUnsupportedTerm(void) {
     char *term = getenv("TERM");
@@ -2125,16 +2124,29 @@ static int setTextAttr(int fd, struct linenoiseTextAttr *textAttr)
         return -1;
     pos = snprintf(buf, 32, "\x1b[0");
     if (textAttr != NULL) {
+        int bold = textAttr->bold_fg;
         if (textAttr->has_fg) {
             if (textAttr->fg_color >= 0 && textAttr->fg_color <= 7) {
-                int fg;
-                fg = textAttr->fg_color + (
-                    !textAttr->bold_fg && !is_bright(*textAttr) || !is256ColorTerm_cached() ? 30 : 90
-                );
+                int fg_base = 30;
+                static const int bright_base = 90;
+
+                if (is_bright(*textAttr)) {
+                    if (is256ColorTerm_cached_value()) {
+                        fg_base = bright_base;
+                    } else {
+                        bold = 1;
+                    }
+                } else if (textAttr->bold_fg) {
+                    if (is256ColorTerm_cached_value()) {
+                        fg_base = bright_base;
+                    }
+                }
+
+                int fg = textAttr->fg_color + fg_base;
                 pos += sprintf(buf + pos, ";%d", fg);
             }
         }
-        if (textAttr->bold_fg || is_bright(*textAttr) && !is256ColorTerm_cached()) {
+        if (bold) {
             pos += sprintf(buf + pos, ";%d", 1);
         }
         if (textAttr->underline){
