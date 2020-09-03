@@ -773,14 +773,50 @@ static void cursorToLeft(struct current *current)
     current->x = 0;
 }
 
+#if USE_UTF8
+BOOL WriteConsoleUTF8(HANDLE hConsoleOutput, const char* buf, int len, DWORD *n, LPVOID reserved)
+{
+    int i;
+
+    if (len <= 0) {
+        *n = 0;
+        return TRUE;
+    }
+
+    int pchars = utf8_strlen(buf, len);
+
+    PWCHAR wbuf = (PWCHAR) malloc(sizeof(wchar_t) * (pchars + 1) );
+
+    for (i = 0; i < pchars; ++i) {
+        int uc = 0;
+        int chlen = utf8_tounicode(buf, &uc);
+        wbuf[i] = (WCHAR) uc;
+        buf += chlen;
+    }
+
+    wbuf[pchars] = 0;
+
+    BOOL result = WriteConsoleW(hConsoleOutput, wbuf, pchars, n, 0);
+
+    free(wbuf);
+
+    return result;
+}
+
+#endif
+
 static int outputChars(struct current *current, const char *buf, int len)
 {
     COORD pos = { (SHORT)current->x, (SHORT)current->y };
     DWORD n;
 
     SetConsoleCursorPosition(current->outh, pos);
+#if USE_UTF8
+    WriteConsoleUTF8(current->outh, buf, len, &n, 0);
+#else
     WriteConsoleA(current->outh, buf, len, &n, 0);
-    current->x += len;
+#endif
+    current->x += n;
     return 0;
 }
 
@@ -2372,7 +2408,11 @@ static void printLineFromStart(HANDLE handle, struct linenoiseTextWithAttr const
         }
         if (textWithAttr[i].text != NULL) {
             size_t len = strlen(textWithAttr[i].text);
+#if USE_UTF8
+            WriteConsoleUTF8(handle, textWithAttr[i].text, len, &dummy, NULL);
+#else
             WriteFile(handle, textWithAttr[i].text, len, &dummy, NULL);
+#endif
         }
     }
 
