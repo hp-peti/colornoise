@@ -774,8 +774,12 @@ static void cursorToLeft(struct current *current)
 }
 
 #if USE_UTF8
+static
 BOOL WriteConsoleUTF8(HANDLE hConsoleOutput, const char* buf, int len, DWORD *n, LPVOID reserved)
 {
+    wchar_t *wbuf;
+    wchar_t tmp[256];
+    int pchars;
     int i;
 
     if (len <= 0) {
@@ -783,22 +787,22 @@ BOOL WriteConsoleUTF8(HANDLE hConsoleOutput, const char* buf, int len, DWORD *n,
         return TRUE;
     }
 
-    int pchars = utf8_strlen(buf, len);
+    pchars = utf8_to_wchar(buf, len, tmp, sizeof(tmp)/sizeof(tmp[0]));
 
-    PWCHAR wbuf = (PWCHAR) malloc(sizeof(wchar_t) * (pchars + 1) );
+    if (pchars == len)
+        return WriteConsoleA(hConsoleOutput, buf, len, n, reserved);
 
-    for (i = 0; i < pchars; ++i) {
-        int uc = 0;
-        int chlen = utf8_tounicode(buf, &uc);
-        wbuf[i] = (WCHAR) uc;
-        buf += chlen;
+    if (pchars < sizeof(tmp) / sizeof(tmp[0])) {
+        wbuf = tmp;
+    } else {
+        wbuf = (wchar_t *)malloc(sizeof(wchar_t) * (pchars + 1));
+        utf8_to_wchar(buf, len, wbuf, pchars + 1);
     }
 
-    wbuf[pchars] = 0;
+    BOOL result = WriteConsoleW(hConsoleOutput, wbuf, pchars, n, reserved);
 
-    BOOL result = WriteConsoleW(hConsoleOutput, wbuf, pchars, n, 0);
-
-    free(wbuf);
+    if (wbuf != tmp)
+        free(wbuf);
 
     return result;
 }

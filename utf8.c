@@ -56,7 +56,7 @@ int utf8_strlen(const char *str, int bytelen)
     if (bytelen < 0) {
         bytelen = strlen(str);
     }
-    while (bytelen) {
+    while (bytelen > 0) {
         int c;
         int l = utf8_tounicode(str, &c);
         charlen++;
@@ -111,5 +111,40 @@ int utf8_tounicode(const char *str, int *uc)
     *uc = *s;
     return 1;
 }
+
+int utf8_to_wchar(const char *str, int bytelen, wchar_t *wstr, int charlen_max)
+{
+    int charlen = 0;
+    if (bytelen < 0) {
+        bytelen = strlen(str);
+    }
+
+    while (bytelen > 0) {
+        int c;
+        int l = utf8_tounicode(str, &c);
+        charlen++;
+        str += l;
+        bytelen -= l;
+
+        if (charlen_max <= 0)
+            break;
+        *wstr++ = (wchar_t)c;
+        --charlen_max;
+    }
+
+    while (bytelen > 0) {
+        int c;
+        int l = utf8_tounicode(str, &c);
+        charlen++;
+        str += l;
+        bytelen -= l;
+    }
+
+    if (charlen_max > 0)
+        *wstr = 0;
+
+    return charlen;
+}
+
 
 #endif

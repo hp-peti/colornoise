@@ -4,6 +4,7 @@
  * UTF-8 utility functions
  *
  * (c) 2010 Steve Bennett <steveb@workware.net.au>
+ * (c) 2020 Peter Hanos-Puskai <hp.peti@gmail.com>
  *
  * See LICENCE for licence details.
  */
@@ -18,6 +19,7 @@
 #define utf8_charlen(C) 1
 
 #else
+#include <wchar.h>
 /**
  * Converts the given unicode codepoint (0 - 0xffff) to utf-8
  * and stores the result at 'p'.
@@ -73,6 +75,23 @@ int utf8_index(const char *str, int charindex);
  * Does not support unicode code points > \uffff
  */
 int utf8_tounicode(const char *str, int *uc);
+
+/**
+* Converts utf8 string to wide chars
+*
+* Returns the number of characters in the utf-8
+* string of the given byte length.
+*
+* Any bytes which are not part of an valid utf-8
+* sequence are treated as individual characters.
+*
+* Does not support unicode code points > \uffff
+*
+* Goes up to bytelen. If bytelen is negative, it calculates the length of the string
+* 
+* Stores output to wstr up until charlen is reached.
+*/
+int utf8_to_wchar(const char *str, int bytelen, wchar_t *wstr, int charlen);
 
 #endif
 
